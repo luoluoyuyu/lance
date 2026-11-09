@@ -3,13 +3,14 @@
 
 //! Statistics collection utilities
 
+mod scalar;
+
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arrow_array::{
-    Array, ArrayRef, ArrowNumericType, ArrowPrimitiveType, OffsetSizeTrait, PrimitiveArray,
-    RecordBatch, StructArray,
+    Array, ArrayRef, ArrowNumericType, OffsetSizeTrait, RecordBatch, StructArray,
     builder::{ArrayBuilder, BooleanBuilder, PrimitiveBuilder, make_builder},
     builder::{GenericBinaryBuilder, GenericStringBuilder},
     cast::{AsArray, as_generic_binary_array, as_primitive_array},
@@ -23,11 +24,11 @@ use arrow_array::{
     },
 };
 use arrow_schema::{ArrowError, DataType, Field as ArrowField, Schema as ArrowSchema, TimeUnit};
-use datafusion_common::ScalarValue;
 use lance_arrow::{DataTypeExt, as_fixed_size_binary_array};
 use lance_core::Result;
 use lance_core::datatypes::{Field, Schema};
 use num_traits::{Float, Zero, bounds::Bounded};
+use scalar::{ScalarValue, StatPrimitive};
 use std::str;
 
 /// Max number of bytes that are included in statistics for binary columns.
@@ -81,10 +82,9 @@ where
     (min_value, max_value, null_count)
 }
 
-fn get_statistics<T: ArrowNumericType>(arrays: &[&ArrayRef]) -> StatisticsRow
+fn get_statistics<T: ArrowNumericType + StatPrimitive>(arrays: &[&ArrayRef]) -> StatisticsRow
 where
     T::Native: Bounded,
-    datafusion_common::scalar::ScalarValue: From<<T as ArrowPrimitiveType>::Native>,
 {
     debug_assert!(!arrays.is_empty());
     // Note: we take data_type off of arrays instead of using T::DATA_TYPE because
@@ -93,8 +93,8 @@ where
     let (min_value, max_value, null_count) = compute_primitive_statistics::<T>(arrays);
     StatisticsRow {
         null_count,
-        min_value: ScalarValue::new_primitive::<T>(Some(min_value), arrays[0].data_type()).unwrap(),
-        max_value: ScalarValue::new_primitive::<T>(Some(max_value), arrays[0].data_type()).unwrap(),
+        min_value: T::to_scalar(min_value, arrays[0].data_type()),
+        max_value: T::to_scalar(max_value, arrays[0].data_type()),
     }
 }
 
@@ -135,10 +135,9 @@ where
     (min_value, max_value, null_count)
 }
 
-fn get_float_statistics<T: ArrowNumericType>(arrays: &[&ArrayRef]) -> StatisticsRow
+fn get_float_statistics<T: ArrowNumericType + StatPrimitive>(arrays: &[&ArrayRef]) -> StatisticsRow
 where
     T::Native: Bounded + Float,
-    datafusion_common::scalar::ScalarValue: From<<T as ArrowPrimitiveType>::Native>,
 {
     let (mut min_value, mut max_value, null_count) = compute_float_statistics::<T>(arrays);
 
@@ -150,13 +149,10 @@ where
         max_value = T::Native::zero();
     }
 
-    let min_value = ScalarValue::from(min_value);
-    let max_value = ScalarValue::from(max_value);
-
     StatisticsRow {
         null_count,
-        min_value,
-        max_value,
+        min_value: T::to_scalar(min_value, arrays[0].data_type()),
+        max_value: T::to_scalar(max_value, arrays[0].data_type()),
     }
 }
 
@@ -805,7 +801,7 @@ impl StatisticsBuilder {
         }
     }
 
-    fn statistics_appender<T: arrow_array::ArrowPrimitiveType>(&mut self, row: StatisticsRow) {
+    fn statistics_appender<T: StatPrimitive>(&mut self, row: StatisticsRow) {
         let min_value_builder = self
             .min_value
             .as_any_mut()
@@ -817,22 +813,8 @@ impl StatisticsBuilder {
             .downcast_mut::<PrimitiveBuilder<T>>()
             .unwrap();
 
-        let min_value = row
-            .min_value
-            .to_array()
-            .unwrap()
-            .as_any()
-            .downcast_ref::<PrimitiveArray<T>>()
-            .unwrap()
-            .value(0);
-        let max_value = row
-            .max_value
-            .to_array()
-            .unwrap()
-            .as_any()
-            .downcast_ref::<PrimitiveArray<T>>()
-            .unwrap()
-            .value(0);
+        let min_value = T::from_scalar(&row.min_value).unwrap();
+        let max_value = T::from_scalar(&row.max_value).unwrap();
 
         self.null_count.append_value(row.null_count);
         min_value_builder.append_value(min_value);
@@ -936,7 +918,7 @@ mod tests {
         DictionaryArray, DurationMicrosecondArray, DurationMillisecondArray,
         DurationNanosecondArray, DurationSecondArray, FixedSizeBinaryArray, Float32Array,
         Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, LargeBinaryArray,
-        LargeStringArray, StringArray, Time32MillisecondArray, Time32SecondArray,
+        LargeStringArray, PrimitiveArray, StringArray, Time32MillisecondArray, Time32SecondArray,
         Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
         TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
         UInt16Array, UInt32Array, UInt64Array, builder::StringDictionaryBuilder, make_array,
@@ -1958,7 +1940,7 @@ mod tests {
         value: ScalarValue,
         with_nulls: bool,
     ) -> std::result::Result<(), TestCaseError> {
-        let array_scalar = value.to_scalar().unwrap();
+        let array_scalar = value.to_scalar();
         let (array, _) = array_scalar.get();
         let array = make_array(array.to_data());
 
@@ -2040,8 +2022,7 @@ mod tests {
 
     // Property 2: The min and max should always be less than / greater than
     // all values in the array respectively.
-    fn assert_min_max_ordering_float<F: ArrowPrimitiveType>()
-    -> std::result::Result<(), TestCaseError>
+    fn assert_min_max_ordering_float<F: StatPrimitive>() -> std::result::Result<(), TestCaseError>
     where
         F::Native: Float,
     {
@@ -2073,24 +2054,22 @@ mod tests {
             // Assert min is <= all values
             prop_assert!(subset.iter().all(|val| val.is_nan()
                 || stats.min_value
-                    <= ScalarValue::new_primitive::<F>(Some(*val), &F::DATA_TYPE).unwrap()));
+                    <= F::to_scalar(*val, &F::DATA_TYPE)));
 
             // Assert max is >= all values
             prop_assert!(subset.iter().all(|val| val.is_nan()
                 || stats.max_value
-                    >= ScalarValue::new_primitive::<F>(Some(*val), &F::DATA_TYPE).unwrap()));
+                    >= F::to_scalar(*val, &F::DATA_TYPE)));
 
             // If array is empty, assert min and max are -inf, +inf, respectively
             if subset.is_empty() {
                 prop_assert_eq!(
                     stats.min_value,
-                    ScalarValue::new_primitive::<F>(Some(F::Native::neg_infinity()), &F::DATA_TYPE)
-                        .unwrap()
+                    F::to_scalar(F::Native::neg_infinity(), &F::DATA_TYPE)
                 );
                 prop_assert_eq!(
                     stats.max_value,
-                    ScalarValue::new_primitive::<F>(Some(F::Native::infinity()), &F::DATA_TYPE)
-                        .unwrap()
+                    F::to_scalar(F::Native::infinity(), &F::DATA_TYPE)
                 );
             }
 
